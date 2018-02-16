@@ -24,10 +24,10 @@
  * Use is subject to license terms.
  */
 
-#ifndef _LIBSPL_STRINGS_H
-#define	_LIBSPL_STRINGS_H
+#ifndef _LIBSPL_SYS_STRINGS_H
+#define	_LIBSPL_SYS_STRINGS_H
 
 #include <string.h>
-#include_next <strings.h>
+#include <strings.h>
 
 #endif

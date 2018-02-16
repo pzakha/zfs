@@ -59,7 +59,7 @@ spl_mutex_clear_owner(kmutex_t *mp)
 	mp->m_owner = NULL;
 }
 
-#define	mutex_owner(mp)		(ACCESS_ONCE((mp)->m_owner))
+#define	mutex_owner(mp)		(READ_ONCE((mp)->m_owner))
 #define	mutex_owned(mp)		(mutex_owner(mp) == current)
 #define	MUTEX_HELD(mp)		mutex_owned(mp)
 #define	MUTEX_NOT_HELD(mp)	(!MUTEX_HELD(mp))
