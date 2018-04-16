@@ -1,5 +1,4 @@
 ../tree/zfsutils-linux/* /
-lib/systemd/system/zfs-load-module.service
 lib/systemd/system/zfs-mount.service
 lib/systemd/system/zfs-share.service
 lib/systemd/system/zfs-import-scan.service
@@ -12,7 +11,7 @@ lib/udev/
 etc/default/zfs
 etc/zfs/zfs-functions
 etc/zfs/zpool.d/
-usr/lib/zfs-linux/zpool.d/
+usr/lib/*/zfs/zpool.d/
 sbin/fsck.zfs
 sbin/mount.zfs
 sbin/ztest
