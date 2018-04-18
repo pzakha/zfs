@@ -1,8 +1,8 @@
 Meta:         1
 Name:         zfs
 Branch:       1.0
-Version:      1.0.0
-Release:      1
+Version:      _DELPHIX_PKG_VERSION_
+Release:      _DELPHIX_PKG_REVISION_
 Release-Tags: relext
 License:      CDDL
 Author:       OpenZFS on Linux

@@ -1,4 +1,4 @@
-zfs-linux (1.0.0-0ubuntu1) UNRELEASED; urgency=medium
+zfs-linux (_DELPHIX_PKG_VERSION_-_DELPHIX_PKG_REVISION_) UNRELEASED; urgency=medium
 
   * New upstream release
 
