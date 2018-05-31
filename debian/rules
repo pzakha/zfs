@@ -6,7 +6,7 @@ LSB_DISTRIBUTOR := $(shell lsb_release -is)
 NAME := $(shell awk '$$1 == "Name:" { print $$2; }' META)
 
 DKMSFILES := module include config zfs.release.in autogen.sh META AUTHORS \
-		DISCLAIMER COPYRIGHT OPENSOLARIS.LICENSE README.markdown
+		NOTICE COPYRIGHT LICENSE README.md
 
 ifndef BUILD_UDEB
 BUILD_UDEB=false
