@@ -198,6 +198,5 @@ Depends: libnvpair1linux (= ${binary:Version}),
          zfs-dbg (= ${binary:Version}),
          zfs-initramfs (= ${binary:Version}),
          zfs-test (= ${binary:Version}),
-         zfs-zed (= ${binary:Version}),
-         delphix-zfs-modules
+         zfs-zed (= ${binary:Version})
 Description: Meta package for all ZFS packages installed on a Delphix appliance.
