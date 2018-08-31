@@ -119,7 +119,6 @@ ifeq ($(BUILD_UDEB), true)
 endif
 
 override_dh_strip:
-	dh_strip --dbg-package=zfs-dbg
 ifeq ($(BUILD_UDEB), true)
 	dh_strip -plibnvpair1-udeb
 	dh_strip -plibuutil1-udeb
@@ -197,7 +196,6 @@ override_dh_binary-modules: override_dh_prep-deb-files override_dh_configure_mod
 	dh_installdocs -p${pmodules}
 	dh_installchangelogs -p${pmodules}
 	dh_compress -p${pmodules}
-	dh_strip -p${pmodules}
 	dh_fixperms -p${pmodules}
 	dh_installdeb -p${pmodules}
 	dh_gencontrol -p${pmodules}
