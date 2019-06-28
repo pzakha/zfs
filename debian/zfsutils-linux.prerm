@@ -7,7 +7,7 @@ upgrade | remove)
 	systemctl disable zfs-import.target
 	systemctl disable zfs-mount.service
 	systemctl disable zfs-share.service
-	systemctl disable zfs-zvol-wait.service
+	systemctl disable zfs-volume.service
 	systemctl disable zfs.target
 	;;
 esac
