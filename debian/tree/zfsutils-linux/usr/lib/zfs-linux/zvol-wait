@@ -1,51 +1,81 @@
-#!/bin/bash
+#!/bin/sh
 
-#
-# Create an array of existing zvols
-#
-readarray -t zvols < <(zfs list -t volume -H -o name)
-echo "Testing ${#zvols[@]} zvol links"
+count_zvols() {
+	if [ -z "$zvols" ]; then
+		echo 0
+	else
+		echo "$zvols" | wc -l
+	fi
+}
 
-#shellcheck disable=SC2034
-for outer_loop in {1..15}; do
-	#
-	# Test each zvol link, and remove zvol from array if link
-	# is present.
-	#
-	remaining=${#zvols[@]}
-	for inner_loop in {1..60}; do
-		for i in "${!zvols[@]}"; do
-			[[ -e /dev/${zvols[$i]} ]] && unset "zvols[$i]"
-		done
+filter_out_zvols_with_links() {
+	while read -r zvol; do
+		if [ ! -e "/dev/$zvol" ]; then
+			echo "$zvol"
+		fi
+	done
+}
 
-		new_remaining=${#zvols[@]}
-		if [[ $new_remaining -eq 0 ]]; then
-			udevadm settle
+filter_out_deleted_zvols() {
+	while read -r zvol; do
+		if zfs list "$zvol" >/dev/null 2>&1; then
+			echo "$zvol"
+		fi
+	done
+}
+
+zvols=$(zfs list -t volume -H -o name)
+zvols_count=$(count_zvols)
+if [ "$zvols_count" -eq 0 ]; then
+	echo "No zvols found, nothing to do."
+	exit 0
+fi
+
+echo "Testing $zvols_count zvol links"
+
+outer_loop=0
+while [ "$outer_loop" -lt 20 ]; do
+	outer_loop=$((outer_loop + 1))
+
+	old_zvols_count=$(count_zvols)
+
+	inner_loop=0
+	while [ "$inner_loop" -lt 30 ]; do
+		inner_loop=$((inner_loop + 1))
+
+		zvols="$(echo "$zvols" | filter_out_zvols_with_links)"
+
+		zvols_count=$(count_zvols)
+		if [ "$zvols_count" -eq 0 ]; then
+			echo "All zvol links are now present."
 			exit 0
 		fi
 		sleep 1
 	done
 
-	echo "Still waiting on $new_remaining zvol links ..."
+	echo "Still waiting on $zvols_count zvol links ..."
 	#
 	# Although zvols should normally not be deleted at boot time,
 	# if that is the case then their links will be missing and
 	# we would stall.
 	#
-	if [[ $new_remaining -eq $remaining ]]; then
+	if [ "$old_zvols_count" -eq "$zvols_count" ]; then
 		echo "No progress since last loop."
 		echo "Checking if any zvols were deleted."
-		for i in "${!zvols[@]}"; do
-			if ! zfs list "${zvols[$i]}" &>/dev/null; then
-				echo "${zvols[$i]} was deleted."
-				unset "zvols[$i]"
-			fi
-		done
-		if [[ ${#zvols[@]} -ne 0 ]]; then
+
+		zvols=$(echo "$zvols" | filter_out_deleted_zvols)
+		zvols_count=$(count_zvols)
+
+		if [ "$old_zvols_count" -ne "$zvols_count" ]; then
+			echo "$((old_zvols_count - zvols_count)) zvol(s) deleted."
+		fi
+
+		if [ "$zvols_count" -ne 0 ]; then
 			echo "Remaining zvols:"
-			for zvol in "${zvols[@]}"; do
-				echo "$zvol"
-			done
+			echo "$zvols"
+		else
+			echo "All zvol links are now present."
+			exit 0
 		fi
 	fi
 done
