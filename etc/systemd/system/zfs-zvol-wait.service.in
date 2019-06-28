@@ -1,0 +1,13 @@
+[Unit]
+Description=Wait for ZFS Volume (zvol) /dev links
+DefaultDependencies=no
+After=systemd-udev-settle.service
+After=zfs-import.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/zfs-linux/zvol-wait
+
+[Install]
+WantedBy=zfs.target

@@ -1,0 +1,54 @@
+#!/bin/bash
+
+#
+# Create an array of existing zvols
+#
+readarray -t zvols < <(zfs list -t volume -H -o name)
+echo "Testing ${#zvols[@]} zvol links"
+
+#shellcheck disable=SC2034
+for outer_loop in {1..15}; do
+	#
+	# Test each zvol link, and remove zvol from array if link
+	# is present.
+	#
+	remaining=${#zvols[@]}
+	for inner_loop in {1..60}; do
+		for i in "${!zvols[@]}"; do
+			[[ -e /dev/${zvols[$i]} ]] && unset "zvols[$i]"
+		done
+
+		new_remaining=${#zvols[@]}
+		if [[ $new_remaining -eq 0 ]]; then
+			udevadm settle
+			exit 0
+		fi
+		sleep 1
+	done
+
+	echo "Still waiting on $new_remaining zvol links ..."
+	#
+	# Although zvols should normally not be deleted at boot time,
+	# if that is the case then their links will be missing and
+	# we would stall.
+	#
+	if [[ $new_remaining -eq $remaining ]]; then
+		echo "No progress since last loop."
+		echo "Checking if any zvols were deleted."
+		for i in "${!zvols[@]}"; do
+			if ! zfs list "${zvols[$i]}" &>/dev/null; then
+				echo "${zvols[$i]} was deleted."
+				unset "zvols[$i]"
+			fi
+		done
+		if [[ ${#zvols[@]} -ne 0 ]]; then
+			echo "Remaining zvols:"
+			for zvol in "${zvols[@]}"; do
+				echo "$zvol"
+			done
+		fi
+	fi
+done
+
+echo "Timed out waiting on zvol links"
+exit 1
