@@ -7,7 +7,7 @@ After=zfs-import.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/lib/zfs-linux/zvol-wait
+ExecStart=@bindir@/zfs_volume_wait
 
 [Install]
 WantedBy=zfs.target

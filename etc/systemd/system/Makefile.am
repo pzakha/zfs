@@ -7,8 +7,8 @@ systemdunit_DATA = \
 	zfs-import-scan.service \
 	zfs-mount.service \
 	zfs-share.service \
-	zfs-import.target \
 	zfs-volume.service \
+	zfs-import.target \
 	zfs.target
 
 EXTRA_DIST = \
