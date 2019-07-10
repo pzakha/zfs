@@ -7,7 +7,7 @@ After=zfs-import.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=@bindir@/zfs_volume_wait
+ExecStart=@bindir@/zvol_wait
 
 [Install]
-WantedBy=zfs.target
+WantedBy=zfs-volume.target

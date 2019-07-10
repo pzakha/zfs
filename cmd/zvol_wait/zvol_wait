@@ -10,7 +10,7 @@ count_zvols() {
 
 filter_out_zvols_with_links() {
 	while read -r zvol; do
-		if [ ! -e "/dev/$zvol" ]; then
+		if [ ! -L "/dev/zvol/$zvol" ]; then
 			echo "$zvol"
 		fi
 	done
