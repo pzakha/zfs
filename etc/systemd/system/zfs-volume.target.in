@@ -1,8 +1,0 @@
-[Unit]
-Description=ZFS volumes are ready
-After=zfs-volume-wait.service
-Requires=zfs-volume-wait.service
-
-# Note that we do not have an [Install] section for now to prevent this target
-# from being started automatically. Services that are interested in this
-# target should add Wants=zfs-volume.target.

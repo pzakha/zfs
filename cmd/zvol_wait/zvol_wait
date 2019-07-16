@@ -24,7 +24,16 @@ filter_out_deleted_zvols() {
 	done
 }
 
-zvols=$(zfs list -t volume -H -o name)
+list_zvols() {
+	zfs list -t volume -H -o name,volmode | while read zvol_line; do
+		name=$(echo "$zvol_line" | awk '{print $1}')
+		volmode=$(echo "$zvol_line" | awk '{print $2}')
+		# /dev links are not created for zvols with volmode = "none".
+		[ "$volmode" = "none" ] || echo "$name"
+	done
+}
+
+zvols=$(list_zvols)
 zvols_count=$(count_zvols)
 if [ "$zvols_count" -eq 0 ]; then
 	echo "No zvols found, nothing to do."

@@ -10,4 +10,4 @@ RemainAfterExit=yes
 ExecStart=@bindir@/zvol_wait
 
 [Install]
-WantedBy=zfs-volume.target
+WantedBy=zfs-volumes.target
