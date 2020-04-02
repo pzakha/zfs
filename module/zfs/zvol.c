@@ -96,6 +96,7 @@ unsigned int zvol_inhibit_dev = 0;
 unsigned int zvol_major = ZVOL_MAJOR;
 unsigned int zvol_threads = 32;
 unsigned int zvol_request_sync = 0;
+unsigned int zvol_sync_by_default = 1;
 unsigned int zvol_prefetch_bytes = (128 * 1024);
 unsigned long zvol_max_discard_blocks = 16384;
 unsigned int zvol_volmode = ZFS_VOLMODE_GEOM;
@@ -766,8 +767,10 @@ zvol_write(void *arg)
 	blk_generic_start_io_acct(zv->zv_queue, WRITE, bio_sectors(bio),
 	    &zv->zv_disk->part0);
 
-	boolean_t sync =
-	    bio_is_fua(bio) || zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS;
+	boolean_t sync = bio_is_fua(bio) ||
+	    zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS ||
+	    (zvol_sync_by_default &&
+	    zv->zv_objset->os_sync == ZFS_SYNC_STANDARD);
 
 	locked_range_t *lr = rangelock_enter(&zv->zv_rangelock,
 	    uio.uio_loffset, uio.uio_resid, RL_WRITER);
@@ -859,7 +862,9 @@ zvol_discard(void *arg)
 	blk_generic_start_io_acct(zv->zv_queue, WRITE, bio_sectors(bio),
 	    &zv->zv_disk->part0);
 
-	sync = bio_is_fua(bio) || zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS;
+	sync = bio_is_fua(bio) || zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS ||
+	    (zvol_sync_by_default &&
+	    zv->zv_objset->os_sync == ZFS_SYNC_STANDARD);
 
 	if (end > zv->zv_volsize) {
 		error = SET_ERROR(EIO);
@@ -2795,6 +2800,10 @@ MODULE_PARM_DESC(zvol_threads, "Max number of threads to handle I/O requests");
 
 module_param(zvol_request_sync, uint, 0644);
 MODULE_PARM_DESC(zvol_request_sync, "Synchronously handle bio requests");
+
+module_param(zvol_sync_by_default, uint, 0644);
+MODULE_PARM_DESC(zvol_sync_by_default,
+	"For zvols treat sync=standard as sync=always");
 
 module_param(zvol_max_discard_blocks, ulong, 0444);
 MODULE_PARM_DESC(zvol_max_discard_blocks, "Max number of blocks to discard");
