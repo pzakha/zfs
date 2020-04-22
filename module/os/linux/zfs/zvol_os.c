@@ -37,9 +37,15 @@
 #include <sys/spa_impl.h>
 #include <sys/zvol.h>
 #include <sys/zvol_impl.h>
+#include <sys/vdev_impl.h>
 
 #include <linux/blkdev_compat.h>
 #include <linux/task_io_accounting_ops.h>
+
+#define	ZVOL_DUMPSIZE		"dumpsize"
+
+extern int zfs_set_prop_nvlist(const char *, zprop_source_t,
+    nvlist_t *, nvlist_t *);
 
 unsigned int zvol_major = ZVOL_MAJOR;
 unsigned int zvol_request_sync = 0;
@@ -68,6 +74,12 @@ typedef struct zv_request {
 	struct bio	*bio;
 	taskq_ent_t	ent;
 } zv_request_t;
+
+typedef struct zvol_extent {
+	list_node_t	ze_node;
+	dva_t		ze_dva;		/* dva associated with this extent */
+	uint64_t	ze_nblks;	/* number of blocks in extent */
+} zvol_extent_t;
 
 /*
  * Given a path, return TRUE if path is a ZVOL.
@@ -563,12 +575,438 @@ zvol_release(struct gendisk *disk, fmode_t mode)
 		rw_exit(&zv->zv_suspend_lock);
 }
 
+/* extent mapping arg */
+struct maparg {
+	zvol_state_t	*ma_zv;
+	uint64_t	ma_blks;
+};
+
+/*ARGSUSED*/
+static int
+zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	struct maparg *ma = arg;
+	zvol_extent_t *ze;
+	int bs = ma->ma_zv->zv_volblocksize;
+
+	if (bp == NULL || BP_IS_HOLE(bp) ||
+	    zb->zb_object != ZVOL_OBJ || zb->zb_level != 0)
+		return (0);
+
+	VERIFY(!BP_IS_EMBEDDED(bp));
+
+	VERIFY3U(ma->ma_blks, ==, zb->zb_blkid);
+	ma->ma_blks++;
+
+	/* Abort immediately if we have encountered gang blocks */
+	if (BP_IS_GANG(bp))
+		return (SET_ERROR(EFRAGS));
+
+	/*
+	 * See if the block is at the end of the previous extent.
+	 */
+	ze = list_tail(&ma->ma_zv->zv_extents);
+	if (ze &&
+	    DVA_GET_VDEV(BP_IDENTITY(bp)) == DVA_GET_VDEV(&ze->ze_dva) &&
+	    DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
+	    DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
+		ze->ze_nblks++;
+		return (0);
+	}
+
+	dprintf_bp(bp, "%s", "next blkptr:");
+
+	/* start a new extent */
+	ze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
+	ze->ze_dva = bp->blk_dva[0];	/* structure assignment */
+	ze->ze_nblks = 1;
+	list_insert_tail(&ma->ma_zv->zv_extents, ze);
+	return (0);
+}
+
+static void
+zvol_free_extents(zvol_state_t *zv)
+{
+	zvol_extent_t *ze;
+
+	while ((ze = list_head(&zv->zv_extents)) != NULL) {
+		list_remove(&zv->zv_extents, ze);
+		kmem_free(ze, sizeof (zvol_extent_t));
+	}
+}
+
+static int
+zvol_get_lbas(zvol_state_t *zv)
+{
+	objset_t *os = zv->zv_objset;
+	struct maparg	ma;
+	int		err;
+
+	ma.ma_zv = zv;
+	ma.ma_blks = 0;
+	zvol_free_extents(zv);
+
+	/* commit any in-flight changes before traversing the dataset */
+	txg_wait_synced(dmu_objset_pool(os), 0);
+	err = traverse_dataset(dmu_objset_ds(os), 0,
+	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block, &ma);
+	if (err || ma.ma_blks != (zv->zv_volsize / zv->zv_volblocksize)) {
+		zvol_free_extents(zv);
+		return (err ? err : EIO);
+	}
+
+	return (0);
+}
+
+static int
+zvol_prealloc(zvol_state_t *zv)
+{
+	objset_t *os = zv->zv_objset;
+	dmu_tx_t *tx;
+	uint64_t refd, avail, usedobjs, availobjs;
+	uint64_t resid = zv->zv_volsize;
+	uint64_t off = 0;
+
+	/* Check the space usage before attempting to allocate the space */
+	dmu_objset_space(os, &refd, &avail, &usedobjs, &availobjs);
+	if (avail < zv->zv_volsize)
+		return (SET_ERROR(ENOSPC));
+
+	/* Free old extents if they exist */
+	zvol_free_extents(zv);
+
+	while (resid != 0) {
+		int error;
+		uint64_t bytes = MIN(resid, SPA_OLD_MAXBLOCKSIZE);
+
+		tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, ZVOL_OBJ, off, bytes);
+		error = dmu_tx_assign(tx, TXG_WAIT);
+		if (error) {
+			dmu_tx_abort(tx);
+			(void) dmu_free_long_range(os, ZVOL_OBJ, 0, off);
+			return (error);
+		}
+		dmu_prealloc(os, ZVOL_OBJ, off, bytes, tx);
+		dmu_tx_commit(tx);
+		off += bytes;
+		resid -= bytes;
+	}
+	txg_wait_synced(dmu_objset_pool(os), 0);
+
+	return (0);
+}
+
+static int
+zfs_mvdev_dump_feature_check(void *arg, dmu_tx_t *tx)
+{
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+
+	if (spa_feature_is_active(spa, SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
+		return (1);
+	return (0);
+}
+
+static void
+zfs_mvdev_dump_activate_feature_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+
+	spa_feature_incr(spa, SPA_FEATURE_MULTI_VDEV_CRASH_DUMP, tx);
+}
+
+static int
+zvol_dump_fini(zvol_state_t *zv)
+{
+	dmu_tx_t *tx;
+	objset_t *os = zv->zv_objset;
+	nvlist_t *nv;
+	int error = 0;
+	uint64_t checksum, compress, refresrv, vbs, dedup;
+	uint64_t version = spa_version(dmu_objset_spa(zv->zv_objset));
+
+	/*
+	 * Attempt to restore the zvol back to its pre-dumpified state.
+	 * This is a best-effort attempt as it's possible that not all
+	 * of these properties were initialized during the dumpify process
+	 * (i.e. error during zvol_dump_init).
+	 */
+
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+	(void) zap_remove(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, tx);
+	dmu_tx_commit(tx);
+
+	(void) zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), 8, 1, &checksum);
+	(void) zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_COMPRESSION), 8, 1, &compress);
+	(void) zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 8, 1, &refresrv);
+	(void) zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), 8, 1, &vbs);
+
+	VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+	(void) nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), checksum);
+	(void) nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_COMPRESSION), compress);
+	(void) nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), refresrv);
+	if (version >= SPA_VERSION_DEDUP &&
+	    zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_DEDUP), 8, 1, &dedup) == 0) {
+		(void) nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_DEDUP), dedup);
+	}
+	(void) zfs_set_prop_nvlist(zv->zv_name, ZPROP_SRC_LOCAL,
+	    nv, NULL);
+	nvlist_free(nv);
+
+	zvol_free_extents(zv);
+	zv->zv_flags &= ~ZVOL_DUMPIFIED;
+	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
+	/* wait for dmu_free_long_range to actually free the blocks */
+	txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+	if (dmu_object_set_blocksize(os, ZVOL_OBJ, vbs, 0, tx) == 0)
+		zv->zv_volblocksize = vbs;
+	dmu_tx_commit(tx);
+
+	return (0);
+}
+
+static int
+zvol_dump_init(zvol_state_t *zv, boolean_t resize)
+{
+	dmu_tx_t *tx;
+	int error;
+	objset_t *os = zv->zv_objset;
+	spa_t *spa = dmu_objset_spa(os);
+	vdev_t *vd = spa->spa_root_vdev;
+	nvlist_t *nv = NULL;
+	uint64_t version = spa_version(spa);
+	uint64_t checksum, compress, refresrv, vbs, dedup;
+
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(vd->vdev_ops == &vdev_root_ops);
+
+	error = dmu_free_long_range(zv->zv_objset, ZVOL_OBJ, 0,
+	    DMU_OBJECT_END);
+	if (error != 0)
+		return (error);
+	/* wait for dmu_free_long_range to actually free the blocks */
+	txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
+
+	/*
+	 * If the pool on which the dump device is being initialized has more
+	 * than one child vdev, check that the MULTI_VDEV_CRASH_DUMP feature is
+	 * enabled.  If so, bump that feature's counter to indicate that the
+	 * feature is active. We also check the vdev type to handle the
+	 * following case:
+	 *   # zpool create test raidz disk1 disk2 disk3
+	 *   Now have spa_root_vdev->vdev_children == 1 (the raidz vdev),
+	 *   the raidz vdev itself has 3 children.
+	 */
+	if (vd->vdev_children > 1 || vd->vdev_ops == &vdev_raidz_ops) {
+		if (!spa_feature_is_enabled(spa,
+		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
+			return (SET_ERROR(ENOTSUP));
+		(void) dsl_sync_task(spa_name(spa),
+		    zfs_mvdev_dump_feature_check,
+		    zfs_mvdev_dump_activate_feature_sync, NULL,
+		    2, ZFS_SPACE_CHECK_RESERVED);
+	}
+
+	if (!resize) {
+		error = dsl_prop_get_integer(zv->zv_name,
+		    zfs_prop_to_name(ZFS_PROP_COMPRESSION), &compress, NULL);
+		if (error == 0) {
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &checksum,
+			    NULL);
+		}
+		if (error == 0) {
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_REFRESERVATION),
+			    &refresrv, NULL);
+		}
+		if (error == 0) {
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), &vbs,
+			    NULL);
+		}
+		if (version >= SPA_VERSION_DEDUP && error == 0) {
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_DEDUP), &dedup, NULL);
+		}
+	}
+	if (error != 0)
+		return (error);
+
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
+	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error != 0) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+
+	/*
+	 * If we are resizing the dump device then we only need to
+	 * update the refreservation to match the newly updated
+	 * zvolsize. Otherwise, we save off the original state of the
+	 * zvol so that we can restore them if the zvol is ever undumpified.
+	 */
+	if (resize) {
+		error = zap_update(os, ZVOL_ZAP_OBJ,
+		    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 8, 1,
+		    &zv->zv_volsize, tx);
+	} else {
+		error = zap_update(os, ZVOL_ZAP_OBJ,
+		    zfs_prop_to_name(ZFS_PROP_COMPRESSION), 8, 1,
+		    &compress, tx);
+		if (error == 0) {
+			error = zap_update(os, ZVOL_ZAP_OBJ,
+			    zfs_prop_to_name(ZFS_PROP_CHECKSUM), 8, 1,
+			    &checksum, tx);
+		}
+		if (error == 0) {
+			error = zap_update(os, ZVOL_ZAP_OBJ,
+			    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 8, 1,
+			    &refresrv, tx);
+		}
+		if (error == 0) {
+			error = zap_update(os, ZVOL_ZAP_OBJ,
+			    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), 8, 1,
+			    &vbs, tx);
+		}
+		if (error == 0) {
+			error = dmu_object_set_blocksize(
+			    os, ZVOL_OBJ, SPA_OLD_MAXBLOCKSIZE, 0, tx);
+		}
+		if (version >= SPA_VERSION_DEDUP && error == 0) {
+			error = zap_update(os, ZVOL_ZAP_OBJ,
+			    zfs_prop_to_name(ZFS_PROP_DEDUP), 8, 1,
+			    &dedup, tx);
+		}
+		if (error == 0)
+			zv->zv_volblocksize = SPA_OLD_MAXBLOCKSIZE;
+	}
+	dmu_tx_commit(tx);
+
+	/*
+	 * We only need update the zvol's property if we are initializing
+	 * the dump area for the first time.
+	 */
+	if (error == 0 && !resize) {
+		/*
+		 * If MULTI_VDEV_CRASH_DUMP is active, use the NOPARITY checksum
+		 * function.  Otherwise, use the old default -- OFF.
+		 */
+		checksum = spa_feature_is_active(spa,
+		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP) ? ZIO_CHECKSUM_NOPARITY :
+		    ZIO_CHECKSUM_OFF;
+
+		VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 0) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
+		    ZIO_COMPRESS_OFF) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
+		    checksum) == 0);
+		if (version >= SPA_VERSION_DEDUP) {
+			VERIFY(nvlist_add_uint64(nv,
+			    zfs_prop_to_name(ZFS_PROP_DEDUP),
+			    ZIO_CHECKSUM_OFF) == 0);
+		}
+
+		error = zfs_set_prop_nvlist(zv->zv_name, ZPROP_SRC_LOCAL,
+		    nv, NULL);
+		nvlist_free(nv);
+	}
+
+	/* Allocate the space for the dump */
+	if (error == 0)
+		error = zvol_prealloc(zv);
+	return (error);
+}
+
+static int
+zvol_dumpify(zvol_state_t *zv)
+{
+	int error = 0;
+	uint64_t dumpsize = 0;
+	dmu_tx_t *tx;
+	objset_t *os = zv->zv_objset;
+
+	if (zv->zv_flags & ZVOL_RDONLY)
+		return (SET_ERROR(EROFS));
+
+	if (zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE,
+	    8, 1, &dumpsize) != 0 || dumpsize != zv->zv_volsize) {
+		boolean_t resize = (dumpsize > 0);
+
+		if ((error = zvol_dump_init(zv, resize)) != 0) {
+			(void) zvol_dump_fini(zv);
+			return (error);
+		}
+	}
+
+	/*
+	 * Build up our lba mapping.
+	 */
+	error = zvol_get_lbas(zv);
+	if (error) {
+		(void) zvol_dump_fini(zv);
+		return (error);
+	}
+
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error) {
+		dmu_tx_abort(tx);
+		(void) zvol_dump_fini(zv);
+		return (error);
+	}
+
+	zv->zv_flags |= ZVOL_DUMPIFIED;
+	error = zap_update(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, 8, 1,
+	    &zv->zv_volsize, tx);
+	dmu_tx_commit(tx);
+
+	if (error) {
+		(void) zvol_dump_fini(zv);
+		return (error);
+	}
+
+	txg_wait_synced(dmu_objset_pool(os), 0);
+	return (0);
+}
+
 static int
 zvol_ioctl(struct block_device *bdev, fmode_t mode,
     unsigned int cmd, unsigned long arg)
 {
 	zvol_state_t *zv = bdev->bd_disk->private_data;
 	int error = 0;
+	zfs_locked_range_t *lr;
 
 	ASSERT3U(zv->zv_open_count, >, 0);
 
@@ -587,6 +1025,26 @@ zvol_ioctl(struct block_device *bdev, fmode_t mode,
 	case BLKZNAME:
 		mutex_enter(&zv->zv_state_lock);
 		error = copy_to_user((void *)arg, zv->zv_name, MAXNAMELEN);
+		mutex_exit(&zv->zv_state_lock);
+		break;
+
+	case DKIOCDUMPINIT:
+		mutex_enter(&zv->zv_state_lock);
+		lr = zfs_rangelock_enter(&zv->zv_rangelock, 0, zv->zv_volsize,
+		    RL_WRITER);
+		error = zvol_dumpify(zv);
+		zfs_rangelock_exit(lr);
+		mutex_exit(&zv->zv_state_lock);
+		break;
+
+	case DKIOCDUMPFINI:
+		if (!(zv->zv_flags & ZVOL_DUMPIFIED))
+			break;
+		mutex_enter(&zv->zv_state_lock);
+		lr = zfs_rangelock_enter(&zv->zv_rangelock, 0, zv->zv_volsize,
+		    RL_WRITER);
+		error = zvol_dump_fini(zv);
+		zfs_rangelock_exit(lr);
 		mutex_exit(&zv->zv_state_lock);
 		break;
 
@@ -802,6 +1260,9 @@ zvol_alloc(dev_t dev, const char *name)
 
 	zfs_rangelock_init(&zv->zv_rangelock, NULL, NULL);
 	rw_init(&zv->zv_suspend_lock, NULL, RW_DEFAULT, NULL);
+
+	list_create(&zv->zv_extents, sizeof (zvol_extent_t),
+	    offsetof(zvol_extent_t, ze_node));
 
 	zso->zvo_disk->major = zvol_major;
 	zso->zvo_disk->events = DISK_EVENT_MEDIA_CHANGE;

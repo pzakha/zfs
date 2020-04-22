@@ -52,6 +52,7 @@ typedef struct zvol_state {
 	list_node_t		zv_next;	/* next zvol_state_t linkage */
 	uint64_t		zv_hash;	/* name hash */
 	struct hlist_node	zv_hlink;	/* hash link */
+	list_t			zv_extents;	/* List of extents for dump */
 	kmutex_t		zv_state_lock;	/* protects zvol_state_t */
 	atomic_t		zv_suspend_ref;	/* refcount for suspend */
 	krwlock_t		zv_suspend_lock;	/* suspend lock */

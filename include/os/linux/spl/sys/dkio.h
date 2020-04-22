@@ -29,6 +29,8 @@
 	(sizeof (dkioc_free_list_t) + (num_exts - 1) * 16)
 
 #define	DKIOC		(0x04 << 8)
+#define	DKIOCDUMPINIT	(DKIOC | 28)	/* Dumpify a zvol */
+#define	DKIOCDUMPFINI	(DKIOC | 29)	/* Un-Dumpify a zvol */
 #define	DKIOCFLUSHWRITECACHE	(DKIOC|34)	/* flush cache to phys medium */
 
 /*

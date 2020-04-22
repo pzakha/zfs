@@ -235,6 +235,9 @@ struct dk_callback {
 #define	DKIOCADDBAD	(DKIOC|20)	/* Re-read the alternate map (IDE) */
 #define	DKIOCGETDEF	(DKIOC|21)	/* read defect list (IDE)	   */
 
+#define	DKIOCDUMPINIT	(DKIOC | 28)	/* Dumpify a zvol */
+#define	DKIOCDUMPFINI	(DKIOC | 29)	/* Un-Dumpify a zvol */
+
 /*
  * Used by applications to get disk defect information from IDE
  * drives.
