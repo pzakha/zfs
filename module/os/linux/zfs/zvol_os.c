@@ -116,6 +116,65 @@ uio_from_bio(uio_t *uio, struct bio *bio)
 }
 
 static void
+zvol_write_dumpio(zvol_state_t *zv, struct bio *bio, uio_t *uio)
+{
+	int error = 0;
+	zvol_extent_t *ze;
+	vdev_t *vd;
+	offset_t offset = uio->uio_loffset;
+	ssize_t size = uio.uio_resid;
+
+	if (size == 0)
+		goto done;
+
+	is (offset + size > zv->zv_volsize) {
+		error = SET_ERROR(EINVAL);
+		goto done;
+	}
+
+	spa_t *spa = dmu_objset_spa(zv->zv_objset);
+
+	unsigned long start_jif = jiffies;
+	blk_generic_start_io_acct(zv->zv_zso->zvo_queue, WRITE,
+	    bio_sectors(bio), &zv->zv_zso->zvo_disk->part0);
+
+	/* Must be sector aligned, and not stradle a block boundary. */
+	if (P2PHASE(offset, DEV_BSIZE) || P2PHASE(offset, DEV_BSIZE) ||
+	    P2BOUNDARY(offset, size, zv->zv_volblocksize)) {
+	    	error = SET_ERROR(EINVAL);
+		goto done;
+	}
+	ASSERT(size <= zv->zv_volblocksize);
+
+
+	/* Locate the extent this belongs to */
+	ze = list_head(&zv->zv_extents);
+	while (offset >= ze->ze_nblks * zv->zv_volblocksize) {
+		offset -= ze->ze_nblks * zv->zv_volblocksize;
+		ze = list_next(&zv->zv_extents, ze);
+	}
+
+	if (ze == NULL) {
+	    	error = SET_ERROR(EINVAL);
+		goto done;
+	}
+
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	vd = vdev_lookup_top(spa, DVA_GET_VDEV(&ze->ze_dva));
+	offset += DVA_GET_OFFSET(&ze->ze_dva);
+	error = zvol_dumpio_vdev(vd, addr, offset, DVA_GET_OFFSET(&ze->ze_dva),
+	    size, doread, isdump);
+
+
+	blk_generic_end_io_acct(zv->zv_zso->zvo_queue,
+	    WRITE, &zv->zv_zso->zvo_disk->part0, start_jif);
+
+done:
+	rw_exit(&zv->zv_suspend_lock);
+	BIO_END_IO(bio, -error);
+}
+
+static void
 zvol_write(void *arg)
 {
 	int error = 0;
@@ -128,6 +187,12 @@ zvol_write(void *arg)
 	zvol_state_t *zv = zvr->zv;
 	ASSERT(zv && zv->zv_open_count > 0);
 	ASSERT(zv->zv_zilog != NULL);
+
+	if (zv->zv_flags & ZVOL_DUMPIFIED) {
+		zvol_write_dumpio(zv, bio, &uio);
+		kmem_free(zvr, sizeof (zv_request_t));
+		return;
+	}
 
 	/* bio marked as FLUSH need to flush before write */
 	if (bio_is_flush(bio))
